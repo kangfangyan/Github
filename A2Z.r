@@ -1,159 +1,139 @@
+# 0. setup ----------------------------------------------------------------
+options(stringsAsFactors = FALSE)
 pkgs = c("GEOquery", 'beadarray', 'illuminaHumanv4.db',
          'limma', "dplyr", 'clusterProfiler')
 sapply(X = pkgs, library, character.only = TRUE)
+# we can of course get rid of limma.autoDE.r, but I am not gonna....
 source('limma.autoDE.r')
 
+
+# 1. read data in ---------------------------------------------------------
+
 gse <- getGEO(destdir = '.',
-              filename = "GSE104237_series_matrix.txt")
+              filename = "GSE104237_series_matrix.txt.gz")
 pData(gse)$group <- c('ctl', 'ctl', 'trt', 'trt')
 
 dim(exprs(gse))
 head(exprs(gse)); tail(exprs(gse))
-#将下载的数据转换为ExpressionSetIllumina
+
+
+# 2. summaryData ----------------------------------------------------------
 summaryData <- as(gse, "ExpressionSetIllumina")
-# summaryData
-# head(fData(summaryData))
-#去除非匹配
-fData(summaryData)$status <- ifelse(fData(summaryData)$PROBEQUALITY == "No match",
-                                    "negative", "regular")
-Detection(summaryData) <- calculateDetection(summaryData,
-                                             status=fData(summaryData)$Status,
-                                             negativeLabel="negative")
-#normalization
-summaryData.norm <- normaliseIllumina(summaryData, status=fData(summaryData)$Status,
+fData(summaryData)$status <- if_else(fData(summaryData)$PROBEQUALITY %in% c("No match", "Bad") |
+                                        is.na(fData(summaryData)$PROBEQUALITY),
+                                    "negative",
+                                    "regular")
+
+# probes with low quality or neg values are then removed
+rm.neg.idx <- fData(summaryData)$status == "negative" | rowMin(exprs(summaryData)) <= 0
+summaryData <- summaryData[!rm.neg.idx, ]
+
+# normalization
+summaryData.norm <- normaliseIllumina(summaryData, status=fData(summaryData)$status,
                                       method="quantile", transform="log2")
 
-# retrive eset data.
-eset <- as.data.frame(exprs(summaryData.norm)) #get exprs
-is.na(eset) = do.call(cbind, lapply(eset, is.infinite)) #remove inf values if any.
-eset <- as.matrix(eset[complete.cases(eset),])
 
+# 3. eSet data ------------------------------------------------------------
+
+# retrive eset data.
+eset <- as.matrix(exprs(summaryData.norm))
 phenoData <- new(Class = 'AnnotatedDataFrame', data = pData(gse)) # create new pData
 eset <- ExpressionSet(assayData = eset,
-                     phenoData = phenoData,
-                     annotation = 'Humanv4') #create new expressionSet object
+                      phenoData = phenoData,
+                      annotation = 'Humanv4') #create new expressionSet object
 eset <- addFeatureData(eset, toAdd = c("SYMBOL", "ENTREZID"), annotation = 'Humanv4') #add other features from IlluminaV4 pacakge.
 
 
-exprs.df = cbind(exprs(eset), as(eset@featureData, Class = 'data.frame'))
-exprs.df = exprs.df[, -grep(pattern = 'Row.names',x = colnames(exprs.df))]
+eset.df <- cbind(exprs(eset), as(eset@featureData, Class = 'data.frame'))
+eset.df <- eset.df[, -grep(pattern = 'Row.names', x = colnames(eset.df))]
 
-table(is.na(exprs.df$SYMBOL))
-# table(is.na(exprs.df$ENSEMBL))
-table(is.na(exprs.df$ENTREZID))
-# filter probes that are not expressed.
-sapply(exprs.df, class)   # options(stringsAsFactors = FALSE) MAKES A DIFFERENCE HERE!
+table(is.na(eset.df$SYMBOL))
+table(is.na(eset.df$ENTREZID))
+sapply(eset.df, class)   # options(stringsAsFactors = FALSE) REALLY MAKES A DIFFERENCE HERE!
 
-# eset <- eset.exprs
+# 4. filter eset --------------------------------------------------------------
 
-# filter GSE --------------------------------------------------------------
+eset.df$gene.exp.median <- apply(eset.df[, 1:4], 1, median)
+eset.df <- eset.df[order(eset.df$SYMBOL,
+                         eset.df$gene.exp.median,
+                         decreasing = TRUE, na.last = TRUE),]
+# we used to use gse instead of eset here, however, gse and eset.df are not the same.
+# Recall that gse contains raw data, while probes with low quality or neg exprs values
+# were removed in eset.df, rsulting a diffrence between gse and eset.df.
+# Basically, here we have to make sure that data are IDENTICAL in BOTH order and number of rows if
+# we are to filter 2 different data.
+# But then again, only eset is needed to perform DE analysis using limma.autoDE(). So here, we
+# no longer consider gse, summaryData or summaryData.norm anymore. Instead, we filter eset.df first and
+# then reconstruct eset data with the new eset.df, which is exprs(eset).
 
-# gse <- gse[!is.na(exprs.df$SYMBOL),]
-exprs.df$gene.exp.median <- apply(exprs.df[, 1:4], 1, median)
-exprs.df <- exprs.df[order(as.character(exprs.df$SYMBOL),
-                           exprs.df$gene.exp.median,
-                           decreasing = TRUE, na.last = TRUE),]
-head(exprs.df)
-tail(exprs.df)
-gse <- gse[order(exprs.df$SYMBOL,
-                 exprs.df$gene.exp.median,
-                 decreasing = TRUE, na.last = TRUE),]
-no.id.idx <- which(is.na(exprs.df$SYMBOL) |
-                     is.na(exprs.df$ENTREZID))
-dup.idx <- which(duplicated(exprs.df$SYMBOL))
-remove.idx <- union(no.id.idx, dup.idx)
+# we thought we could filter eset based on the order we get from eset.df, but we were
+# wrong, sadly. Row order of an ExpressionSet object (eset) is not changed with the
+# following code:
+# eset <- eset[order(eset.df$SYMBOL,
+#                    eset.df$gene.exp.median,
+#                    decreasing = TRUE, na.last = TRUE),]
+# So, we have to come up with a different solution.
+# the above code is kept as a reminder, though.
 
-length(remove.idx)
-dim(exprs.df)
-
-gse <- gse[-remove.idx,]
-# gse <- gse[!(is.na(exprs.df$SYMBOL | exprs.df$ENTREZID)),]
-# gse <- gse
-# phenoData = new(Class = 'AnnotatedDataFrame',data = pData(gse)) # create new pData
-
-summaryData <- as(gse, "ExpressionSetIllumina")
-summaryData
-fData(summaryData)$Status <- ifelse(fData(summaryData)$PROBEQUALITY=="No match",
-                                    "negative","regular" )
-Detection(summaryData) <- calculateDetection(summaryData, status=fData(summaryData)$Status)
-
-summaryData.norm <- normaliseIllumina(summaryData, status=fData(summaryData)$Status,
-                                      method="quantile", transform="log2")
-
-# retrive eset data.
-eset = as.data.frame(exprs(summaryData.norm)) #get exprs
-is.na(eset) = do.call(cbind, lapply(eset, is.infinite)) #remove inf values if any.
-eset = as.matrix(eset[complete.cases(eset),])
-
-phenoData = new(Class = 'AnnotatedDataFrame', data = pData(gse)) # create new pData
-eset = ExpressionSet(assayData = as.matrix(eset),
-                     phenoData = phenoData, annotation = 'Humanv4') #create new expressionSet object
-eset = addFeatureData(eset, toAdd = c("SYMBOL", "ENTREZID"), annotation = 'Humanv4') #add other features from IlluminaV4 pacakge.
+no.gene.idx <- which(is.na(eset.df$SYMBOL) |
+                       is.na(eset.df$ENTREZID))
+eset.df <- eset.df[-no.gene.idx,]
+dup.idx <- which(duplicated(eset.df$SYMBOL))
+eset.df <- eset.df[-dup.idx,]
+# I am always confused here what will happen to the numerous NA duplicated rows
+# in our previous code where we deal with NA and duplicated SYMBOL together.
+# Later it occurred to me that if we filter out NA first and then come to dup
+# SYMBOL, then the problem is safely avoided.
+# The code is more readable, more understandable, only at the cost of
+# being a little redundant, which is tatolly acceptable for me anyway.
 
 
-exprs.df = cbind(exprs(eset),as(eset@featureData,Class = 'data.frame'))
-exprs.df = exprs.df[,-grep(pattern = 'Row.names',x = colnames(exprs.df))]
-head(exprs.df)
-tail(exprs.df)
-sapply(exprs.df, class)
+# 5.  new eSet data -------------------------------------------------------
 
-table(is.na(exprs.df$SYMBOL))
-# table(is.na(exprs.df$ENSEMBL))
-table(is.na(exprs.df$ENTREZID))
+# reconstruct new eSet object from the filtered eset.df data
+eset <- ExpressionSet(assayData = as.matrix(eset.df[, 1:4]),
+                      phenoData = phenoData,
+                      annotation = 'Humanv4') #create new expressionSet object
+eset <- addFeatureData(eset, toAdd = c("SYMBOL", "ENTREZID"), annotation = 'Humanv4')
 
+
+# 6. and then DE analysis ----------------------------------------------------------
 
 # DEG analysis begins here.
 fdr <- 0.05
 
-eset = ExpressionSet(assayData = as.matrix(exprs.df[, 1:4]),
-                     featureData = new(Class = "AnnotatedDataFrame", exprs.df[, 5:6]),
-                     phenoData = phenoData,
-                     annotation = 'Humanv4')
+eset.de <- limma.autoDE(summaryData = eset, SampleGroup = 'group') # run differnetial analysis.
+tt <- topTable(eset.de, number = 'all')  # get toptable.
+res <- merge(eset.df, tt, by = 'row.names') # merge everything.
+res <- res[order(res$adj.P.Val),] # order according to fdr.
 
-# eset$group <- c('ctl', 'ctl', 'trt', 'trt')
-
-eset.de = limma.autoDE(summaryData = eset, SampleGroup = 'group') #run differnetial analysis.
-tt = topTable(eset.de, number = 'all')  #get toptable.
-res = merge(exprs.df, tt, by = 'row.names') #merge everything.
-res = res[order(res$adj.P.Val),] #order according to fdr.
-rownames(res) = res$Row.names
-res = res[,-1]
-
-#get up and down probes
-downProbes = rownames(res[which(res$adj.P.Val < fdr & res$logFC < 0),])
-upProbes = rownames(res[which(res$adj.P.Val < fdr & res$logFC > 0),])
-
-#annotate deg status
-res$down = as.integer(rownames(res) %in% downProbes)
-res$up = as.integer(rownames(res) %in% upProbes)
-res$up = factor(x = res$up, levels = c(1,0), labels = c('up', 'none'))
-res$down = factor(x = res$down, levels = c(1,0), labels = c('down', 'none'))
-res$deg = interaction(res$up, res$down)
-res$deg = as.character(factor(x = res$deg, levels = c("up.down"  ,"none.down","up.none"  ,"none.none"), labels = c('none', 'down', 'up', 'none')))
-res = subset(res, select = -c(up, down))
 
 res.sig <- res %>%
     # filter(!is.na(SYMBOL)) %>%
-    # filter(adj.P.Val < 0.05) %>%
-    filter(P.Value < 0.05) %>%
-    arrange(P.Value, logFC)
+    filter(adj.P.Val < 0.05) %>%
+    # filter(P.Value < 0.05) %>%
+    arrange(adj.P.Val, logFC)
 
+# double check for NA or dup gene symbols in final result
+table(is.na(res.sig$SYMBOL))
 table(duplicated(res.sig$SYMBOL))
-head(sort(table(res.sig$SYMBOL), decreasing = TRUE))
-res.sig$SYMBOL[is.na(res.sig$SYMBOL)]
 
-res.sig$SYMBOL[duplicated(res.sig$SYMBOL)]
+# write out res.sig if you wanna
+write.table(res.sig, file = 'GSE104237_DEG_fdr005.csv',
+            sep = '\t', quote = FALSE, row.names = FALSE)
 
+# 7. just a GO and KEGG eg -------------------------------------------------------------
 
-go <- enrichGO(res.sig$ENTREZID, OrgDb = 'org.Hs.eg.db', keyType = 'ENTREZID', ont = 'BP',
+go.bp <- enrichGO(res.sig$ENTREZID, OrgDb = 'org.Hs.eg.db', keyType = 'ENTREZID', ont = 'BP',
                qvalueCutoff = 0.05, minGSSize = 3)
 go.mf <- enrichGO(res.sig$ENTREZID, OrgDb = 'org.Hs.eg.db', keyType = 'ENTREZID', ont = 'MF',
-               qvalueCutoff = 0.05, minGSSize = 3)
+                  qvalueCutoff = 0.05, minGSSize = 3)
+head(summary(go.bp))
 head(summary(go.mf))
-head(summary(go))
 
+dotplot(go.bp, showCategory=30)
 dotplot(go.mf, showCategory=30)
 
-keg <- enrichKEGG(res.sig$ENTREZID, organism = 'hsa', qvalueCutoff = 0.05, minGSSize = 3)
-# yy <- gseMKEGG(res.sig$ENTREZID)
-summary(keg)
+kegg <- enrichKEGG(res.sig$ENTREZID, organism = 'hsa', qvalueCutoff = 0.05, minGSSize = 3)
+
+summary(kegg)
